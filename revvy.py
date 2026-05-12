@@ -79,10 +79,10 @@ def handle_summarise(transcript: str, sender_id: str, preview_mode: bool = False
 
     if preview_mode:
         send_lark_message(sender_id, f"👀 PREVIEW (not posted to group yet):\n\n{summary}", "open_id")
-        send_lark_message(sender_id, "Reply /confirm to post this to the Leader Group, or /discard to cancel.", "open_id")
+        send_lark_message(sender_id, "Use /summarise [transcript] (without 'preview') to post it to the Leader Group.", "open_id")
     else:
         send_lark_message(LEADER_GROUP_CHAT_ID, summary)
-        send_lark_message(sender_id, "✅ Meeting summary posted to the Leader Group!", "open_id")
+        send_lark_message(sender_id, f"✅ Posted to Leader Group! Here's what was sent:\n\n{summary}", "open_id")
 
 
 def handle_message(data: P2ImMessageReceiveV1) -> None:
