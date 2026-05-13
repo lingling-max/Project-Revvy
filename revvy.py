@@ -283,39 +283,70 @@ def handle_pkr(user_text: str, sender_id: str):
         rows.sort(key=lambda x: (x["bu"].lower(), x["balance"]))
 
         query = user_text.lower()
-        def fmt_row(r):
+        BU_LEADERS = {
+            "the champions": "Fauziah",
+            "the grand line": "Yee Hang",
+            "the corporate sales": "Andy",
+            "the surge team": "Fauziah",
+            "the unbroken legions": "Edward Hoo",
+            "the nova legends": "Edward Hoo",
+            "the vanguard": "Reagen",
+        }
+
+        def fmt_row(r, show_bu=False):
             pct = (r['actual'] / r['target'] * 100) if r['target'] > 0 else 0
             icon = "✅" if r["balance"] >= 0 else "⚠️"
-            return (f"{icon} {r['am']} ({r['bu']}) | "
+            name = f"{r['am']} ({r['bu']})" if show_bu else r['am']
+            return (f"{icon} {name} | "
                     f"Target: RM{r['target']:,.0f} | "
                     f"Actual: RM{r['actual']:,.0f} | "
-                    f"Progress: {pct:.0f}% | "
-                    f"Balance: RM{r['balance']:,.0f}")
+                    f"Balance: RM{r['balance']:,.0f} | "
+                    f"Progress: {pct:.0f}%")
+
+        def build_grouped_output(title, filtered_rows):
+            lines = [f"{title}\n"]
+            # Group by BU
+            from collections import defaultdict
+            by_bu = defaultdict(list)
+            for r in filtered_rows:
+                by_bu[r["bu"]].append(r)
+            for bu in sorted(by_bu.keys()):
+                leader = BU_LEADERS.get(bu.lower(), "")
+                leader_str = f" | Leader: {leader}" if leader else ""
+                bu_rows = by_bu[bu]
+                hitting = sum(1 for r in bu_rows if r["balance"] >= 0)
+                lines.append(f"\n🏢 {bu}{leader_str} ({hitting}/{len(bu_rows)} hitting)")
+                for r in sorted(bu_rows, key=lambda x: x["balance"]):
+                    lines.append(fmt_row(r))
+            return "\n".join(lines)
 
         if "behind" in query or "below" in query or "missing" in query:
             behind = [r for r in rows if r["balance"] < 0]
             if not behind:
                 send_lark_message(sender_id, f"✅ Everyone is on or above target for {latest_week}!", "open_id")
                 return
-            lines = [f"⚠️ Primary Sales PKR — Behind ({latest_week}) | {len(behind)} members\n"]
-            for r in behind:
-                lines.append(fmt_row(r))
+            title = f"⚠️ Primary Sales PKR — Behind ({latest_week}) | {len(behind)} members"
+            send_lark_message(sender_id, build_grouped_output(title, behind), "open_id")
+            return
 
-        elif "above" in query or "hit" in query or "hitting" in query or "champion" in query:
+        elif "above" in query or "hit" in query or "hitting" in query:
             above = [r for r in rows if r["balance"] >= 0]
             if not above:
                 send_lark_message(sender_id, f"⚠️ No one is above target for {latest_week} yet.", "open_id")
                 return
-            lines = [f"✅ Primary Sales PKR — Hitting Target ({latest_week}) | {len(above)} members\n"]
-            for r in above:
-                lines.append(fmt_row(r))
+            title = f"✅ Primary Sales PKR — Hitting Target ({latest_week}) | {len(above)} members"
+            send_lark_message(sender_id, build_grouped_output(title, above), "open_id")
+            return
 
         else:
-            lines = [f"📊 Primary Sales PKR Status — {latest_week} | {len(rows)} members\n"]
-            for r in rows:
-                lines.append(fmt_row(r))
+            title = f"📊 Primary Sales PKR Status — {latest_week} | {len(rows)} members"
+            send_lark_message(sender_id, build_grouped_output(title, rows), "open_id")
+            return
 
-        send_lark_message(sender_id, "\n".join(lines), "open_id")
+        lines = []
+
+        if lines:
+            send_lark_message(sender_id, "\n".join(lines), "open_id")
 
     except Exception as e:
         print(f"PKR error: {e}")
