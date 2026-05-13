@@ -21,6 +21,9 @@ ai_client = Groq(api_key=GROQ_API_KEY)
 # Deduplication — ignore messages already processed
 _seen_message_ids = set()
 
+# PKR data cache — refresh every 5 minutes
+_pkr_cache = {"data": None, "ts": 0}
+
 SYSTEM_PROMPT = """You are Revvy, the AI Commercial Co-Pilot for AJobThing's recruitment agency.
 You help leaders and Account Managers track performance, close deals, and stay on top of their pipeline.
 Be sharp, direct, and helpful. When you have real PKR data, use it — never make up numbers."""
@@ -83,22 +86,46 @@ def get_tenant_token():
 
 
 def fetch_pkr_data(filter_week=None):
-    """Fetch PKR records from Lark Base — one page only to stay fast."""
-    token = get_tenant_token()
-    headers = {"Authorization": f"Bearer {token}"}
+    """Fetch PKR records with 5-minute cache to avoid repeated slow API calls."""
+    import time
+    now = time.time()
 
-    resp = requests.get(
-        f"https://open.larksuite.com/open-apis/bitable/v1/apps/{LARK_BASE_TOKEN}/tables/{LARK_PKR_TABLE_ID}/records",
-        headers=headers,
-        params={"page_size": 100},
-        timeout=15
-    )
-    data = resp.json()
+    # Use cache if fresh (under 5 minutes)
+    if _pkr_cache["data"] is not None and (now - _pkr_cache["ts"]) < 300:
+        print("Using cached PKR data")
+        records = _pkr_cache["data"]
+    else:
+        print("Fetching fresh PKR data from Lark Base...")
+        token = get_tenant_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        records = []
+        page_token = None
 
-    if data.get("code") != 0:
-        raise Exception(f"Lark Base API error: {data.get('msg', data)}")
+        while True:
+            params = {"page_size": 100}
+            if page_token:
+                params["page_token"] = page_token
 
-    records = [item.get("fields", {}) for item in data.get("data", {}).get("items", [])]
+            resp = requests.get(
+                f"https://open.larksuite.com/open-apis/bitable/v1/apps/{LARK_BASE_TOKEN}/tables/{LARK_PKR_TABLE_ID}/records",
+                headers=headers,
+                params=params,
+                timeout=30
+            )
+            data = resp.json()
+
+            if data.get("code") != 0:
+                raise Exception(f"Lark Base API error: {data.get('msg', data)}")
+
+            records += [item.get("fields", {}) for item in data.get("data", {}).get("items", [])]
+
+            if not data.get("data", {}).get("has_more"):
+                break
+            page_token = data["data"]["page_token"]
+
+        _pkr_cache["data"] = records
+        _pkr_cache["ts"] = now
+        print(f"Cached {len(records)} records")
 
     # Filter by week if specified
     if filter_week:
@@ -218,14 +245,21 @@ def handle_pkr(user_text: str, sender_id: str):
             send_lark_message(sender_id, "⚠️ No PKR records found.", "open_id")
             return
 
-        # Get latest week label
+        # Get latest week label — sort numerically by extracting digits
+        def week_sort_key(w):
+            import re
+            nums = re.findall(r'\d+', str(w))
+            return int(nums[-1]) if nums else 0
+
         weeks = [str(get_field(r, "Week") or get_field(r, "Q2 Week")) for r in records]
         weeks = [w for w in weeks if w.strip()]
-        latest_week = sorted(set(weeks))[-1] if weeks else "Latest"
+        latest_week = max(set(weeks), key=week_sort_key) if weeks else "Latest"
+        print(f"Latest week detected: {latest_week}")
 
         # Filter to latest week
         week_records = [r for r in records
                         if str(get_field(r, "Week") or get_field(r, "Q2 Week")) == latest_week]
+        print(f"Records for {latest_week}: {len(week_records)}")
 
         # Build rows with Python-calculated values only
         rows = []
@@ -246,35 +280,37 @@ def handle_pkr(user_text: str, sender_id: str):
         rows.sort(key=lambda x: x["balance"])
 
         query = user_text.lower()
+        def fmt_row(r):
+            pct = (r['actual'] / r['target'] * 100) if r['target'] > 0 else 0
+            icon = "✅" if r["balance"] >= 0 else "⚠️"
+            return (f"{icon} {r['am']} ({r['bu']}) | "
+                    f"Target: RM{r['target']:,.0f} | "
+                    f"Actual: RM{r['actual']:,.0f} | "
+                    f"Progress: {pct:.0f}% | "
+                    f"Balance: RM{r['balance']:,.0f}")
+
         if "behind" in query or "below" in query or "missing" in query:
-            # Only show people who are behind (negative balance)
             behind = [r for r in rows if r["balance"] < 0]
             if not behind:
                 send_lark_message(sender_id, f"✅ Everyone is on or above target for {latest_week}!", "open_id")
                 return
-            lines = [f"⚠️ Behind on PKR — {latest_week} ({len(behind)} members)\n"]
+            lines = [f"⚠️ Primary Sales PKR — Behind ({latest_week}) | {len(behind)} members\n"]
             for r in behind:
-                lines.append(f"• {r['am']} ({r['bu']}) | Target: RM{r['target']:,.0f} | "
-                             f"Actual: RM{r['actual']:,.0f} | Gap: RM{abs(r['balance']):,.0f} short")
+                lines.append(fmt_row(r))
 
         elif "above" in query or "hit" in query or "hitting" in query or "champion" in query:
-            # Only show people on or above target
             above = [r for r in rows if r["balance"] >= 0]
             if not above:
                 send_lark_message(sender_id, f"⚠️ No one is above target for {latest_week} yet.", "open_id")
                 return
-            lines = [f"✅ Hitting PKR — {latest_week} ({len(above)} members)\n"]
+            lines = [f"✅ Primary Sales PKR — Hitting Target ({latest_week}) | {len(above)} members\n"]
             for r in above:
-                lines.append(f"• {r['am']} ({r['bu']}) | Target: RM{r['target']:,.0f} | "
-                             f"Actual: RM{r['actual']:,.0f} | Surplus: RM{r['balance']:,.0f}")
+                lines.append(fmt_row(r))
 
         else:
-            # Show everyone
-            lines = [f"📊 PKR Status — {latest_week} ({len(rows)} members)\n"]
+            lines = [f"📊 Primary Sales PKR Status — {latest_week} | {len(rows)} members\n"]
             for r in rows:
-                icon = "✅" if r["balance"] >= 0 else "⚠️"
-                lines.append(f"{icon} {r['am']} ({r['bu']}) | Target: RM{r['target']:,.0f} | "
-                             f"Actual: RM{r['actual']:,.0f} | Balance: RM{r['balance']:,.0f}")
+                lines.append(fmt_row(r))
 
         send_lark_message(sender_id, "\n".join(lines), "open_id")
 
