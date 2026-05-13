@@ -262,22 +262,25 @@ def handle_pkr(user_text: str, sender_id: str):
         print(f"Records for {latest_week}: {len(week_records)}")
 
         # Build rows with Python-calculated values only
+        EXCLUDE_BU = ["the whale hunter"]  # BUs excluded from progress tracking
         rows = []
         for r in week_records:
             am = get_field(r, "AM Name", "Unknown")
             bu = get_field(r, "BU Name", "")
+            # Skip excluded BUs
+            if bu.lower() in EXCLUDE_BU:
+                continue
             try:
                 target = float(r.get("Weekly Sales Target") or 0)
                 actual = float(r.get("Weekly Sales wo GST") or 0)
-                # Use Lark's pre-calculated balance directly
                 balance = float(r.get("Weekly Sales Balance") or (actual - target))
             except Exception:
                 continue
             rows.append({"am": am, "bu": bu, "target": target,
                          "actual": actual, "balance": balance})
 
-        # Sort by balance (most behind first)
-        rows.sort(key=lambda x: x["balance"])
+        # Sort by BU name, then most behind first within each BU
+        rows.sort(key=lambda x: (x["bu"].lower(), x["balance"]))
 
         query = user_text.lower()
         def fmt_row(r):
