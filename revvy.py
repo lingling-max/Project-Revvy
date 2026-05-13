@@ -18,6 +18,9 @@ LARK_PKR_TABLE_ID = os.environ["LARK_PKR_TABLE_ID"]
 
 ai_client = Groq(api_key=GROQ_API_KEY)
 
+# Deduplication — ignore messages already processed
+_seen_message_ids = set()
+
 SYSTEM_PROMPT = """You are Revvy, the AI Commercial Co-Pilot for AJobThing's recruitment agency.
 You help leaders and Account Managers track performance, close deals, and stay on top of their pipeline.
 Be sharp, direct, and helpful. When you have real PKR data, use it — never make up numbers."""
@@ -73,68 +76,87 @@ def get_tenant_token():
     """Get Lark tenant access token using app credentials."""
     resp = requests.post(
         "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal",
-        json={"app_id": APP_ID, "app_secret": APP_SECRET}
+        json={"app_id": APP_ID, "app_secret": APP_SECRET},
+        timeout=10
     )
     return resp.json().get("tenant_access_token")
 
 
 def fetch_pkr_data(filter_week=None):
-    """Fetch PKR records from Lark Base. Optionally filter by week label."""
+    """Fetch PKR records from Lark Base — one page only to stay fast."""
     token = get_tenant_token()
     headers = {"Authorization": f"Bearer {token}"}
-    records = []
-    page_token = None
 
-    while True:
-        params = {"page_size": 100}
-        if page_token:
-            params["page_token"] = page_token
+    resp = requests.get(
+        f"https://open.larksuite.com/open-apis/bitable/v1/apps/{LARK_BASE_TOKEN}/tables/{LARK_PKR_TABLE_ID}/records",
+        headers=headers,
+        params={"page_size": 100},
+        timeout=15
+    )
+    data = resp.json()
 
-        resp = requests.get(
-            f"https://open.larksuite.com/open-apis/bitable/v1/apps/{LARK_BASE_TOKEN}/tables/{LARK_PKR_TABLE_ID}/records",
-            headers=headers,
-            params=params
-        )
-        data = resp.json()
+    if data.get("code") != 0:
+        raise Exception(f"Lark Base API error: {data.get('msg', data)}")
 
-        if data.get("code") != 0:
-            print(f"Lark Base error: {data}")
-            break
-
-        items = data.get("data", {}).get("items", [])
-        for item in items:
-            fields = item.get("fields", {})
-            records.append(fields)
-
-        if not data.get("data", {}).get("has_more"):
-            break
-        page_token = data.get("data", {}).get("page_token")
+    records = [item.get("fields", {}) for item in data.get("data", {}).get("items", [])]
 
     # Filter by week if specified
     if filter_week:
-        records = [r for r in records if filter_week.lower() in str(r.get("Week", "")).lower()
-                   or filter_week.lower() in str(r.get("Q2 Week", "")).lower()]
+        records = [r for r in records if filter_week.upper() in str(r.get("Week", "")).upper()
+                   or filter_week.upper() in str(r.get("Q2 Week", "")).upper()]
 
     return records
 
 
+def get_field(record, key, default=""):
+    """Safely extract a field from a Lark Base record, handling people/link objects."""
+    val = record.get(key, default)
+    if val is None:
+        return default
+    # People field: [{'en_name': 'Fauziah', 'id': '...', ...}]
+    if isinstance(val, list):
+        if len(val) == 0:
+            return default
+        first = val[0]
+        if isinstance(first, dict):
+            return first.get("en_name", first.get("name", str(first)))
+        return str(first)
+    return val
+
+
 def format_pkr_summary(records):
-    """Format PKR records into a readable summary for AI context."""
+    """Aggregate PKR records into a compact summary to stay within AI token limits."""
     if not records:
         return "No PKR data found."
 
-    lines = []
-    for r in records:
-        am = r.get("AM Name", "Unknown")
-        bu = r.get("BU Name", "")
-        target = r.get("Weekly Sales Target", "")
-        projection = r.get("Projection Weekly", "")
-        actual = r.get("Weekly Sales wo GST", "")
-        balance = r.get("Weekly Sales Balan...", r.get("Weekly Sales Balance", ""))
-        pkr = r.get("Primary PKR", "")
-        week = r.get("Week", r.get("Q2 Week", ""))
+    # Find the most recent week in the data
+    weeks = [str(get_field(r, "Week") or get_field(r, "Q2 Week")) for r in records]
+    weeks = [w for w in weeks if w.strip()]
+    latest_week = sorted(set(weeks))[-1] if weeks else None
 
-        lines.append(f"- {am} ({bu}) | Week: {week} | PKR: {pkr} | Target: {target} | Projection: {projection} | Actual: {actual} | Balance: {balance}")
+    # Filter to latest week only
+    if latest_week:
+        records = [r for r in records if str(get_field(r, "Week") or get_field(r, "Q2 Week")) == latest_week]
+
+    lines = [f"PKR Data — Week: {latest_week or 'Latest'} | {len(records)} members\n"]
+    for r in records:
+        am = get_field(r, "AM Name", "Unknown")
+        bu = get_field(r, "BU Name", "")
+        pkr_pct = r.get("Primary PKR %") or r.get("Primary PKR") or ""
+
+        try:
+            target = float(r.get("Weekly Sales Target") or 0)
+            projection = float(r.get("Projection Weekly") or 0)
+            actual = float(r.get("Weekly Sales wo GST") or 0)
+            gap = projection - target
+            status = "✅" if gap >= 0 else "⚠️"
+            gap_str = f"{status} {'above' if gap >= 0 else 'below'} by RM{abs(gap):,.0f}"
+            line = (f"• {am} ({bu}) | Target: RM{target:,.0f} | "
+                    f"Projection: RM{projection:,.0f} | Actual: RM{actual:,.0f} | {gap_str}")
+        except Exception as e:
+            line = f"• {am} ({bu}) | PKR: {pkr_pct} | (number parse error: {e})"
+
+        lines.append(line)
 
     return "\n".join(lines)
 
@@ -180,41 +202,85 @@ def handle_summarise(transcript: str, sender_id: str, preview_mode: bool = False
 
 
 def handle_pkr(user_text: str, sender_id: str):
-    """Fetch PKR data and answer questions about it."""
+    """Fetch PKR data and return Python-calculated results — no AI math."""
     send_lark_message(sender_id, "⏳ Pulling latest PKR data from Lark Base...", "open_id")
 
-    # Try to detect week from message
-    week_filter = None
-    for word in user_text.split():
-        if word.upper().startswith("W") and word[1:].isdigit():
-            week_filter = word.upper()
-            break
-
-    records = fetch_pkr_data(filter_week=week_filter)
-    pkr_text = format_pkr_summary(records)
-
-    prompt = f"""You are Revvy, AI Co-Pilot for a recruitment agency.
-Here is the latest PKR data from Lark Base:
-
-{pkr_text}
-
-User asked: {user_text}
-
-Answer their question using the real data above. Be specific — name names, quote numbers.
-If someone is at risk or behind, flag it clearly with ⚠️.
-Format your answer cleanly for a Lark chat message."""
-
     try:
-        response = ai_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1000
-        )
-        reply = response.choices[0].message.content
-    except Exception as e:
-        reply = f"Error querying AI: {e}"
+        # Detect week from message
+        week_filter = None
+        for word in user_text.split():
+            if word.upper().startswith("W") and word[1:].isdigit():
+                week_filter = word.upper()
+                break
 
-    send_lark_message(sender_id, reply, "open_id")
+        records = fetch_pkr_data(filter_week=week_filter)
+        if not records:
+            send_lark_message(sender_id, "⚠️ No PKR records found.", "open_id")
+            return
+
+        # Get latest week label
+        weeks = [str(get_field(r, "Week") or get_field(r, "Q2 Week")) for r in records]
+        weeks = [w for w in weeks if w.strip()]
+        latest_week = sorted(set(weeks))[-1] if weeks else "Latest"
+
+        # Filter to latest week
+        week_records = [r for r in records
+                        if str(get_field(r, "Week") or get_field(r, "Q2 Week")) == latest_week]
+
+        # Build rows with Python-calculated values only
+        rows = []
+        for r in week_records:
+            am = get_field(r, "AM Name", "Unknown")
+            bu = get_field(r, "BU Name", "")
+            try:
+                target = float(r.get("Weekly Sales Target") or 0)
+                actual = float(r.get("Weekly Sales wo GST") or 0)
+                # Use Lark's pre-calculated balance directly
+                balance = float(r.get("Weekly Sales Balance") or (actual - target))
+            except Exception:
+                continue
+            rows.append({"am": am, "bu": bu, "target": target,
+                         "actual": actual, "balance": balance})
+
+        # Sort by balance (most behind first)
+        rows.sort(key=lambda x: x["balance"])
+
+        query = user_text.lower()
+        if "behind" in query or "below" in query or "missing" in query:
+            # Only show people who are behind (negative balance)
+            behind = [r for r in rows if r["balance"] < 0]
+            if not behind:
+                send_lark_message(sender_id, f"✅ Everyone is on or above target for {latest_week}!", "open_id")
+                return
+            lines = [f"⚠️ Behind on PKR — {latest_week} ({len(behind)} members)\n"]
+            for r in behind:
+                lines.append(f"• {r['am']} ({r['bu']}) | Target: RM{r['target']:,.0f} | "
+                             f"Actual: RM{r['actual']:,.0f} | Gap: RM{abs(r['balance']):,.0f} short")
+
+        elif "above" in query or "hit" in query or "hitting" in query or "champion" in query:
+            # Only show people on or above target
+            above = [r for r in rows if r["balance"] >= 0]
+            if not above:
+                send_lark_message(sender_id, f"⚠️ No one is above target for {latest_week} yet.", "open_id")
+                return
+            lines = [f"✅ Hitting PKR — {latest_week} ({len(above)} members)\n"]
+            for r in above:
+                lines.append(f"• {r['am']} ({r['bu']}) | Target: RM{r['target']:,.0f} | "
+                             f"Actual: RM{r['actual']:,.0f} | Surplus: RM{r['balance']:,.0f}")
+
+        else:
+            # Show everyone
+            lines = [f"📊 PKR Status — {latest_week} ({len(rows)} members)\n"]
+            for r in rows:
+                icon = "✅" if r["balance"] >= 0 else "⚠️"
+                lines.append(f"{icon} {r['am']} ({r['bu']}) | Target: RM{r['target']:,.0f} | "
+                             f"Actual: RM{r['actual']:,.0f} | Balance: RM{r['balance']:,.0f}")
+
+        send_lark_message(sender_id, "\n".join(lines), "open_id")
+
+    except Exception as e:
+        print(f"PKR error: {e}")
+        send_lark_message(sender_id, f"❌ Error: {e}", "open_id")
 
 
 def extract_text(msg_content: dict, msg_type: str) -> str:
@@ -243,6 +309,13 @@ def handle_message(data: P2ImMessageReceiveV1) -> None:
         for mention in msg_content.get("mentions", []):
             user_text = user_text.replace(mention.get("key", ""), "").strip()
 
+    # Deduplicate — skip if already processed
+    message_id = data.event.message.message_id
+    if message_id in _seen_message_ids:
+        print(f"Skipping duplicate message: {message_id}")
+        return
+    _seen_message_ids.add(message_id)
+
     sender_id = data.event.sender.sender_id.open_id
     chat_id = data.event.message.chat_id
     print(f"[{msg_type}] Revvy heard: {user_text[:80]}")
@@ -266,6 +339,20 @@ def handle_message(data: P2ImMessageReceiveV1) -> None:
 
     elif user_text.lower().strip() == "/summarise":
         send_lark_message(sender_id, "📌 Usage:\n/summarise [paste meeting notes]\n/summarise preview [paste meeting notes]", "open_id")
+
+    # /debug — show raw Lark Base response
+    elif user_text.lower().strip() == "/debug":
+        try:
+            token = get_tenant_token()
+            send_lark_message(sender_id, f"✅ Tenant token: {token[:20]}...", "open_id")
+            records = fetch_pkr_data()
+            if records:
+                sample = records[0]
+                send_lark_message(sender_id, f"✅ Got {len(records)} records\nFirst record keys: {list(sample.keys())}\nSample: {str(sample)[:300]}", "open_id")
+            else:
+                send_lark_message(sender_id, "⚠️ No records returned from Lark Base", "open_id")
+        except Exception as e:
+            send_lark_message(sender_id, f"❌ Error: {e}", "open_id")
 
     # /pkr — query live PKR data from Lark Base
     elif user_text.lower().startswith("/pkr"):
