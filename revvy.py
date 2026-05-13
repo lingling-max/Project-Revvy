@@ -15,6 +15,7 @@ GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 LEADER_GROUP_CHAT_ID = os.environ["LEADER_GROUP_CHAT_ID"]
 LARK_BASE_TOKEN = os.environ["LARK_BASE_TOKEN"]
 LARK_PKR_TABLE_ID = os.environ["LARK_PKR_TABLE_ID"]
+LARK_BU_PROGRESS_TABLE_ID = os.environ["LARK_BU_PROGRESS_TABLE_ID"]
 
 ai_client = Groq(api_key=GROQ_API_KEY)
 
@@ -23,6 +24,7 @@ _seen_message_ids = set()
 
 # PKR data cache — refresh every 5 minutes
 _pkr_cache = {"data": None, "ts": 0}
+_bu_cache = {"data": None, "ts": 0}
 
 SYSTEM_PROMPT = """You are Revvy, the AI Commercial Co-Pilot for AJobThing's recruitment agency.
 You help leaders and Account Managers track performance, close deals, and stay on top of their pipeline.
@@ -185,6 +187,96 @@ def format_pkr_summary(records):
 
         lines.append(line)
 
+    return "\n".join(lines)
+
+
+def fetch_bu_progress():
+    """Fetch BU Progress records with 5-minute cache."""
+    import time
+    now = time.time()
+    if _bu_cache["data"] is not None and (now - _bu_cache["ts"]) < 300:
+        return _bu_cache["data"]
+
+    token = get_tenant_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    records = []
+    page_token = None
+
+    while True:
+        params = {"page_size": 100}
+        if page_token:
+            params["page_token"] = page_token
+        resp = requests.get(
+            f"https://open.larksuite.com/open-apis/bitable/v1/apps/{LARK_BASE_TOKEN}/tables/{LARK_BU_PROGRESS_TABLE_ID}/records",
+            headers=headers, params=params, timeout=30
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            raise Exception(f"BU Progress API error: {data.get('msg', data)}")
+        records += [item.get("fields", {}) for item in data.get("data", {}).get("items", [])]
+        if not data.get("data", {}).get("has_more"):
+            break
+        page_token = data["data"]["page_token"]
+
+    _bu_cache["data"] = records
+    _bu_cache["ts"] = now
+    return records
+
+
+def build_bu_progress_report(filter_bu=None, exclude_bu=None):
+    """Build BU Progress report for latest week."""
+    import re
+    records = fetch_bu_progress()
+
+    # Get latest week numerically
+    def week_key(w):
+        nums = re.findall(r'\d+', str(w))
+        return int(nums[-1]) if nums else 0
+
+    weeks = [str(r.get("Q2 Week", "")) for r in records if r.get("Q2 Week")]
+    latest_week = max(set(weeks), key=week_key) if weeks else "Latest"
+    week_records = [r for r in records if str(r.get("Q2 Week", "")) == latest_week]
+
+    # Apply BU filters
+    if filter_bu:
+        week_records = [r for r in week_records if r.get("BU Name", "").lower() in [b.lower() for b in filter_bu]]
+    if exclude_bu:
+        week_records = [r for r in week_records if r.get("BU Name", "").lower() not in [b.lower() for b in exclude_bu]]
+
+    week_records.sort(key=lambda r: r.get("BU Name", ""))
+
+    lines = [f"📊 BU Progress Report — {latest_week}\n"]
+    total_sales = 0
+    total_target = 0
+
+    for r in week_records:
+        bu = r.get("BU Name", "Unknown")
+        sales = float(r.get("Team Weekly Sales") or 0)
+        target = float(r.get("Team Weekly Sales Target") or r.get("Manual Weekly Sales Target") or 1)
+        sales_pct = (sales / target * 100) if target > 0 else 0
+        primary_pkr = float(r.get("Primary PKR") or 0) * 100
+        bu_okr = float(r.get("BU OKR Progress") or 0) * 100
+        training = float(r.get("Team Weekly S&P Skill Training") or 0)
+        training_target = float(r.get("Team Weekly S&P Skill Training Target") or 0)
+        member_pkr = float(r.get("Total Team Member PKR") or 0)
+        member_pkr_target = float(r.get("Total Team Member PKR Target") or 0)
+
+        sales_icon = "✅" if sales >= target else "⚠️"
+        pkr_icon = "✅" if primary_pkr >= 100 else "⚠️"
+
+        lines.append(
+            f"\n🏢 {bu}\n"
+            f"  {sales_icon} Sales: RM{sales:,.0f} / RM{target:,.0f} ({sales_pct:.0f}%)\n"
+            f"  {pkr_icon} Primary PKR: {primary_pkr:.1f}%\n"
+            f"  📈 BU OKR: {bu_okr:.1f}%\n"
+            f"  📚 Training: {training:.1f} / {training_target:.1f}\n"
+            f"  👥 Member PKR Score: {member_pkr:.2f} / {member_pkr_target:.0f}"
+        )
+        total_sales += sales
+        total_target += target
+
+    overall_pct = (total_sales / total_target * 100) if total_target > 0 else 0
+    lines.append(f"\n─────────────────\n💰 Total Sales: RM{total_sales:,.0f} / RM{total_target:,.0f} ({overall_pct:.0f}%)")
     return "\n".join(lines)
 
 
@@ -386,6 +478,15 @@ def handle_message(data: P2ImMessageReceiveV1) -> None:
         return
     _seen_message_ids.add(message_id)
 
+    # Skip stale messages — ignore anything older than 60 seconds
+    import time
+    msg_ts = data.event.message.create_time
+    if msg_ts:
+        msg_age = time.time() - int(str(msg_ts)[:10])
+        if msg_age > 60:
+            print(f"Skipping stale message ({msg_age:.0f}s old): {user_text[:50]}")
+            return
+
     sender_id = data.event.sender.sender_id.open_id
     chat_id = data.event.message.chat_id
     print(f"[{msg_type}] Revvy heard: {user_text[:80]}")
@@ -409,6 +510,15 @@ def handle_message(data: P2ImMessageReceiveV1) -> None:
 
     elif user_text.lower().strip() == "/summarise":
         send_lark_message(sender_id, "📌 Usage:\n/summarise [paste meeting notes]\n/summarise preview [paste meeting notes]", "open_id")
+
+    # /bu — BU Progress report
+    elif user_text.lower().startswith("/bu"):
+        try:
+            send_lark_message(sender_id, "⏳ Pulling BU Progress from Lark Base...", "open_id")
+            report = build_bu_progress_report()
+            send_lark_message(sender_id, report, "open_id")
+        except Exception as e:
+            send_lark_message(sender_id, f"❌ Error: {e}", "open_id")
 
     # /debug — show raw Lark Base response
     elif user_text.lower().strip() == "/debug":
