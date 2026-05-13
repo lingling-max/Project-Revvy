@@ -254,24 +254,33 @@ def build_bu_progress_report(filter_bu=None, exclude_bu=None):
         sales = float(r.get("Team Weekly Sales") or 0)
         target = float(r.get("Team Weekly Sales Target") or r.get("Manual Weekly Sales Target") or 1)
         sales_pct = (sales / target * 100) if target > 0 else 0
-        primary_pkr = float(r.get("Primary PKR") or 0) * 100
         bu_okr = float(r.get("BU OKR Progress") or 0) * 100
         training = float(r.get("Team Weekly S&P Skill Training") or 0)
         training_target = float(r.get("Team Weekly S&P Skill Training Target") or 0)
-        member_pkr = float(r.get("Total Team Member PKR") or 0)
-        member_pkr_target = float(r.get("Total Team Member PKR Target") or 0)
+        accept_pt = r.get("Accept Challenge Point") or "0"
+        accept_target = r.get("Accept Challenge Target") or "10"
+        activate = r.get("Activate Big Companies") or "0"
+        activate_target = r.get("Activate Big Companies Target") or "0"
 
         sales_icon = "✅" if sales >= target else "⚠️"
-        pkr_icon = "✅" if primary_pkr >= 100 else "⚠️"
+        okr_icon = "✅" if bu_okr >= 100 else "⚠️"
+        accept_icon = "✅" if float(accept_pt) >= float(accept_target) else "⚠️"
 
-        lines.append(
+        row = (
             f"\n🏢 {bu}\n"
+            f"  {okr_icon} BU OKR: {bu_okr:.1f}%\n"
             f"  {sales_icon} Sales: RM{sales:,.0f} / RM{target:,.0f} ({sales_pct:.0f}%)\n"
-            f"  {pkr_icon} Primary PKR: {primary_pkr:.1f}%\n"
-            f"  📈 BU OKR: {bu_okr:.1f}%\n"
-            f"  📚 Training: {training:.1f} / {training_target:.1f}\n"
-            f"  👥 Member PKR Score: {member_pkr:.2f} / {member_pkr_target:.0f}"
         )
+
+        if bu == "The Corporate Sales":
+            activate_icon = "✅" if float(activate) >= float(activate_target) else "⚠️"
+            row += f"  {activate_icon} Activate Big Company: {activate} / {activate_target}\n"
+        else:
+            training_icon = "✅" if training >= training_target else "⚠️"
+            row += f"  {training_icon} Training: {training:.1f} / {training_target:.1f}\n"
+
+        row += f"  {accept_icon} Accept Challenge: {accept_pt} / {accept_target}"
+        lines.append(row)
         total_sales += sales
         total_target += target
 
